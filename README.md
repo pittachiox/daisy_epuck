@@ -1,4 +1,4 @@
 # daisy_epuck
 
 ![maze](maze.png)
-![flowchart](flowchart.png)
+![flowchart](flowchart.jpg)
