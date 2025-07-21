@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
 #
 # Description: Python controller for an e-puck robot implementing a robust
-#              wall-following behavior using a PD-controller. This version
-#              is a complete rework for stability and precise distance keeping.
+#              wall-following behavior. This version uses a dual P-controller
+#              for distance and orientation, calculates pose using odometry,
+#              and logs the pose to a CSV file.
 #
 # Original Author: Cyberbotics Ltd.
 # Python Conversion & Enhancement: Gemini
 #
 
 from controller import Robot
+import csv
+import math
 
 # --- Global Defines ---
 
@@ -46,20 +49,24 @@ PS_LEFT_00 = 7
 OBSTACLE_THRESHOLD = 100.0      # ค่า sensor ขั้นต่ำที่ด้านหน้าเพื่อเริ่มพฤติกรรม
 WALL_LOST_THRESHOLD = 80.0      # ค่า sensor ขั้นต่ำที่ด้านข้างเพื่อตัดสินว่ากำแพงหายไป
 
-# --- ค่าคงที่สำหรับจูน PD-controller ในการเดินตามกำแพง ---
-# [REWORKED] ปรับจูนค่าสำหรับ PD Controller เพื่อความเสถียรสูงสุด
-TARGET_DISTANCE = 120.0         # (เป้าหมาย) ค่า sensor ที่ต้องการ, ค่ายิ่งน้อย -> หุ่นยนต์ยิ่งอยู่ห่างกำแพง
-BASE_SPEED = 150                # ความเร็วพื้นฐานขณะเคลื่อนที่
-WALL_FOLLOW_KP = 0.5            # (Proportional Gain) อัตราขยายตามระยะห่าง
-WALL_FOLLOW_KD = 1.0            # (Derivative Gain) อัตราขยายตามการเปลี่ยนแปลงของระยะห่าง (ช่วยลดการแกว่ง)
+# --- ค่าคงที่สำหรับจูน Controller ---
+# [REWORKED] ปรับจูนค่าสำหรับ Controller ที่ควบคุมทั้งระยะห่างและมุม
+TARGET_DISTANCE = 150.0         # (เป้าหมาย) ค่า sensor ที่ต้องการจากกำแพง
+BASE_SPEED = 200                # ความเร็วพื้นฐานขณะเคลื่อนที่
+KP_dist = 0.3                   # (Proportional Gain) อัตราขยายสำหรับรักษาระยะห่าง
+KP_angle = 0.2                  # (Proportional Gain) อัตราขยายสำหรับปรับให้หุ่นยนต์ขนานกับกำแพง
 SHARP_TURN_SPEED = 200          # ความเร็วในการเลี้ยวหักศอกเมื่อเจอทางตัน
+
+# --- [NEW] E-puck Robot Parameters for Odometry ---
+WHEEL_RADIUS = 0.0205  # in meters
+AXLE_LENGTH = 0.052    # in meters
 
 # --- Main Controller Class ---
 
 class WallFollower(Robot):
     """
-    A controller class for the e-puck robot that implements
-    a robust wall-following behavior using a PD-controller.
+    A controller class for the e-puck robot that implements a robust
+    wall-following behavior and calculates its pose using odometry.
     """
     def __init__(self):
         super(WallFollower, self).__init__()
@@ -68,7 +75,10 @@ class WallFollower(Robot):
         self.following_wall = False
         self.wall_side = NO_SIDE
         self.final_speed = [0, 0]
-        self.previous_error = 0.0   # สำหรับเก็บค่า error ครั้งก่อนหน้า (ใช้ใน D-controller)
+        # [NEW] Odometry pose variables
+        self.pose_x = 0.0
+        self.pose_y = 0.0
+        self.pose_phi = 0.0 # orientation in radians
         
         # --- Initialize Devices ---
         self.ps = []
@@ -85,41 +95,78 @@ class WallFollower(Robot):
         self.left_motor.setVelocity(0.0)
         self.right_motor.setVelocity(0.0)
 
+        # --- [MODIFIED] ตั้งค่าไฟล์ CSV สำหรับบันทึกข้อมูล Pose ---
+        try:
+            self.csv_file = open('pose_log.csv', 'w', newline='')
+            self.csv_writer = csv.writer(self.csv_file)
+            # เขียนส่วนหัวของไฟล์ CSV
+            self.csv_writer.writerow(['timestamp', 'x', 'y', 'phi'])
+        except IOError as e:
+            print(f"Error opening CSV file: {e}")
+            self.csv_file = None
+
+
     def run(self):
         """
         Main control loop.
         """
-        while self.step(TIME_STEP) != -1:
-            # 1. อ่านค่าจากเซ็นเซอร์
-            ps_values = [sensor.getValue() for sensor in self.ps]
+        try:
+            while self.step(TIME_STEP) != -1:
+                # 1. อ่านค่าจากเซ็นเซอร์
+                ps_values = [sensor.getValue() for sensor in self.ps]
 
-            # 2. เรียกใช้ Controller หลักเพื่อคำนวณความเร็ว
-            self.wall_following_controller(ps_values)
-            
-            # 3. ดึงค่าความเร็วสุดท้าย
-            final_speed_left = self.final_speed[LEFT]
-            final_speed_right = self.final_speed[RIGHT]
+                # 2. เรียกใช้ Controller หลักเพื่อคำนวณความเร็ว
+                self.wall_following_controller(ps_values)
+                
+                # 3. ดึงค่าความเร็วสุดท้าย
+                final_speed_left = self.final_speed[LEFT]
+                final_speed_right = self.final_speed[RIGHT]
 
-            # Debug print
-            mode = "Following" if self.following_wall else "Searching"
-            side_str = "Left" if self.wall_side == LEFT else "Right" if self.wall_side == RIGHT else "None"
-            print(f"Mode: {mode}, Side: {side_str}, "
-                  f"L_Speed: {final_speed_left:.2f}, R_Speed: {final_speed_right:.2f}")
+                # 4. แปลงความเร็วและตั้งค่ามอเตอร์
+                left_velocity_rad_s = final_speed_left * 0.00628
+                right_velocity_rad_s = final_speed_right * 0.00628
+                
+                self.left_motor.setVelocity(left_velocity_rad_s)
+                self.right_motor.setVelocity(right_velocity_rad_s)
 
-            # 4. ตั้งค่าความเร็วมอเตอร์
-            self.left_motor.setVelocity(final_speed_left * 0.00628)
-            self.right_motor.setVelocity(final_speed_right * 0.00628)
+                # 5. [NEW] Odometry Calculation
+                delta_t = TIME_STEP / 1000.0 # time step in seconds
+                
+                # Calculate robot's linear and angular velocities
+                v_left = left_velocity_rad_s * WHEEL_RADIUS
+                v_right = right_velocity_rad_s * WHEEL_RADIUS
+                
+                v = (v_right + v_left) / 2.0
+                omega = (v_right - v_left) / AXLE_LENGTH
+                
+                # Update pose
+                self.pose_phi += omega * delta_t
+                self.pose_x += v * math.cos(self.pose_phi) * delta_t
+                self.pose_y += v * math.sin(self.pose_phi) * delta_t
+
+                # [MODIFIED] Print current pose to the console
+                print(f"Pose: x={self.pose_x:.3f} m, y={self.pose_y:.3f} m, phi={self.pose_phi:.3f} rad")
+
+                # 6. [MODIFIED] บันทึกข้อมูล Pose ลงไฟล์ CSV
+                if self.csv_file:
+                    timestamp = self.getTime()
+                    self.csv_writer.writerow([timestamp, self.pose_x, self.pose_y, self.pose_phi])
+        
+        finally:
+            # 7. ปิดไฟล์ CSV เมื่อจบการทำงาน
+            if self.csv_file:
+                self.csv_file.close()
+                print("CSV pose log file closed.")
+
 
     def wall_following_controller(self, ps_values):
         """
-        Controller หลักที่ใช้ PD-controller เพื่อรักษาระยะห่างจากกำแพง
+        Controller หลักที่ใช้ P-controller 2 ส่วน เพื่อรักษาระยะห่างและปรับมุมให้ขนานกับกำแพง
         """
         # --- อ่านค่า sensor ที่สำคัญ ---
         left_front_val = ps_values[PS_LEFT_00]
         right_front_val = ps_values[PS_RIGHT_00]
-        left_side_val = ps_values[PS_LEFT_90]
-        right_side_val = ps_values[PS_RIGHT_90]
-
+        
         front_obstacle_detected = (left_front_val > OBSTACLE_THRESHOLD or
                                    right_front_val > OBSTACLE_THRESHOLD)
 
@@ -130,8 +177,6 @@ class WallFollower(Robot):
             if front_obstacle_detected:
                 # เจอกำแพง -> เปลี่ยนสถานะเป็น Following และเลือกฝั่งที่จะตาม
                 self.following_wall = True
-                self.previous_error = 0.0 # รีเซ็ตค่า error
-                # [IMPROVED] ตัดสินใจว่าจะตามกำแพงฝั่งไหน
                 if left_front_val > right_front_val:
                     self.wall_side = LEFT
                 else:
@@ -145,9 +190,9 @@ class WallFollower(Robot):
         
         # ตรวจสอบว่ากำแพงหายไปหรือไม่
         wall_is_lost = False
-        if self.wall_side == RIGHT and right_side_val < WALL_LOST_THRESHOLD and ps_values[PS_RIGHT_45] < WALL_LOST_THRESHOLD:
+        if self.wall_side == RIGHT and ps_values[PS_RIGHT_90] < WALL_LOST_THRESHOLD and ps_values[PS_RIGHT_45] < WALL_LOST_THRESHOLD:
             wall_is_lost = True
-        elif self.wall_side == LEFT and left_side_val < WALL_LOST_THRESHOLD and ps_values[PS_LEFT_45] < WALL_LOST_THRESHOLD:
+        elif self.wall_side == LEFT and ps_values[PS_LEFT_90] < WALL_LOST_THRESHOLD and ps_values[PS_LEFT_45] < WALL_LOST_THRESHOLD:
             wall_is_lost = True
         
         if wall_is_lost:
@@ -165,35 +210,41 @@ class WallFollower(Robot):
                 self.final_speed = [SHARP_TURN_SPEED, -SHARP_TURN_SPEED] # เลี้ยวขวา
             return
 
-        # --- กรณีปกติ: ใช้ PD-controller เพื่อรักษาระยะห่างจากกำแพง ---
-        error = 0.0
-        distance = 0.0
+        # --- กรณีปกติ: ใช้ Controller 2 ส่วน (ระยะห่าง + มุม) ---
         
         if self.wall_side == RIGHT:
-            distance = right_side_val
-        else: # LEFT
-            distance = left_side_val
+            # 1. คำนวณค่า Correction จากระยะห่าง
+            dist_error = ps_values[PS_RIGHT_90] - TARGET_DISTANCE
+            dist_correction = KP_dist * dist_error
             
-        error = distance - TARGET_DISTANCE
-        
-        # [NEW] คำนวณค่า Derivative
-        derivative = error - self.previous_error
-        
-        # คำนวณค่าการปรับแก้ความเร็วทั้งหมด
-        correction = (WALL_FOLLOW_KP * error) + (WALL_FOLLOW_KD * derivative)
-        
-        # อัปเดตค่า error สำหรับ loop ถัดไป
-        self.previous_error = error
-
-        # นำค่า correction ไปปรับความเร็วล้อ
-        if self.wall_side == RIGHT:
-            # ถ้าใกล้ไป (error > 0) -> เลี้ยวซ้าย (เพิ่มล้อซ้าย, ลดล้อขวา)
-            left_speed = BASE_SPEED + correction
-            right_speed = BASE_SPEED - correction
+            # 2. คำนวณค่า Correction จากมุม (พยายามทำให้ ps2 และ ps1 มีค่าเท่ากัน)
+            angle_error = ps_values[PS_RIGHT_90] - ps_values[PS_RIGHT_45]
+            angle_correction = KP_angle * angle_error
+            
+            # 3. รวมค่า Correction ทั้งหมด
+            total_correction = dist_correction + angle_correction
+            
+            # 4. ปรับความเร็ว
+            # correction > 0 หมายถึง ต้องเลี้ยวซ้าย (ห่างจากกำแพง)
+            left_speed = BASE_SPEED + total_correction
+            right_speed = BASE_SPEED - total_correction
+            
         else: # LEFT
-            # ถ้าใกล้ไป (error > 0) -> เลี้ยวขวา (ลดล้อซ้าย, เพิ่มล้อขวา)
-            left_speed = BASE_SPEED - correction
-            right_speed = BASE_SPEED + correction
+            # 1. คำนวณค่า Correction จากระยะห่าง
+            dist_error = ps_values[PS_LEFT_90] - TARGET_DISTANCE
+            dist_correction = KP_dist * dist_error
+            
+            # 2. คำนวณค่า Correction จากมุม (พยายามทำให้ ps5 และ ps6 มีค่าเท่ากัน)
+            angle_error = ps_values[PS_LEFT_90] - ps_values[PS_LEFT_45]
+            angle_correction = KP_angle * angle_error
+            
+            # 3. รวมค่า Correction ทั้งหมด
+            total_correction = dist_correction + angle_correction
+            
+            # 4. ปรับความเร็ว
+            # correction > 0 หมายถึง ต้องเลี้ยวขวา (ห่างจากกำแพง)
+            left_speed = BASE_SPEED - total_correction
+            right_speed = BASE_SPEED + total_correction
 
         # จำกัดความเร็วสูงสุดและต่ำสุดเพื่อความเสถียร
         max_speed = BASE_SPEED * 1.5
